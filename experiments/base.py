@@ -5,39 +5,60 @@ import torch
 from threading import Thread, Lock
 from typing import Dict, List, Optional, Tuple
 from omegaconf import OmegaConf, DictConfig
-from override import TensorRTExecutor
+from override import BaseExecutor
 import threading
 import nvtx
+from collections import deque
 
 
-class TensorRTWorkerThread(Thread, metaclass=LoggingMeta):
+class WorkerThread(Thread, metaclass=LoggingMeta):
     def __init__(
         self,
-        executor: TensorRTExecutor,
+        executor: BaseExecutor,
         device: str = "cuda:0",
         worker_id: int = 0,
         daemon: bool = True,
-        enable_nvtx: bool = True
+        enable_nvtx: bool = True,
+        num_streams: int = 1
     ):
         super().__init__(
-            name=f"TRT-Worker-{worker_id}",
+            name=f"TRT-Worker-{worker_id}-{num_streams}streams",
             daemon=daemon
         )
         self.completion_events: Dict[int, torch.cuda.Event] = {}
         self.event_lock = threading.Lock()
 
-        self.executor: TensorRTExecutor = executor
+        self.executor: BaseExecutor = executor
         self.worker_id: int = worker_id
         self.device: str = device
         self.enable_nvtx: bool = enable_nvtx
+        self.num_streams: int = num_streams
 
-        self.input_queue: Queue[int, Dict[str, torch.Tensor]] = Queue()
-        self.result_queue: Queue[int, List[torch.Tensor]] = Queue()
+        self.streams: List[torch.cuda.Stream] = []
+        self._initialize_streams()
+
+        self.stream_rotation = deque(range(self.num_streams))
+        self.stream_lock = threading.Lock()
+
+        self.input_queue: Queue[Tuple[int, Dict[str, torch.Tensor], int]] = Queue()
+        self.result_queue: Queue[Tuple[int, List[torch.Tensor]]] = Queue()
         self._running: bool = False
 
         self.processed_tasks: int = 0
         self.failed_tasks: int = 0
         self.lock: Lock = Lock()
+
+    def _initialize_streams(self) -> None:
+        for i in range(self.num_streams):
+            stream = torch.cuda.Stream(device=self.device)
+            self.streams.append(stream)
+        self.logger.info(f"Worker {self.worker_id} initialized with {self.num_streams} CUDA streams")
+
+    def _get_next_stream(self) -> Tuple[int, torch.cuda.Stream]:
+        with self.stream_lock:
+            stream_id = self.stream_rotation[0]
+            self.stream_rotation.rotate(-1)
+            return stream_id, self.streams[stream_id]
 
     @property
     def running(self) -> bool:
@@ -46,12 +67,13 @@ class TensorRTWorkerThread(Thread, metaclass=LoggingMeta):
     def submit(self, input_feed: Dict[str, torch.Tensor]) -> int:
         task_id = int(time.time() * 1000) + self.worker_id * 10000 + self.processed_tasks
 
-        # Create synchronization marker for current task_id
+        stream_id, stream = self._get_next_stream()
+
         completion_event = torch.cuda.Event(enable_timing=False)
         with self.event_lock:
             self.completion_events[task_id] = completion_event
 
-        self.input_queue.put((task_id, input_feed))
+        self.input_queue.put((task_id, input_feed, stream_id))
         return task_id
 
     def get_completion_event(self, task_id: int) -> Optional[torch.cuda.Event]:
@@ -64,20 +86,22 @@ class TensorRTWorkerThread(Thread, metaclass=LoggingMeta):
         except Empty:
             return None
 
-    @nvtx.annotate(f"_process_next_task")
+    @nvtx.annotate("_process_next_task")
     def _process_next_task(self) -> None:
         def push_results(task_id: int, results: Optional[List[torch.Tensor]] = None) -> None:
             # Record point to get synchronized results from parallel tasks
             with self.event_lock:
                 event = self.completion_events.get(task_id)
                 if event is not None:
-                    event.record(self.executor.cuda_stream)
-            self.result_queue.put((task_id, results))
+                    event.record(stream)
+            self.result_queue.put_nowait((task_id, results))
 
         try:
-            task_id, input_feed = self.input_queue.get(timeout=0.01)
-            with nvtx.annotate(f"Worker_{self.worker_id}_process_task"):
-                results = self._execute_inference(input_feed)
+            task_id, input_feed, stream_id = self.input_queue.get_nowait()
+            stream = self.streams[stream_id]
+
+            with nvtx.annotate(f"Worker_{self.worker_id}_stream_{stream_id}_process_task"):
+                results = self._execute_inference(input_feed, stream)
                 push_results(task_id, results)
                 with self.lock:
                     self.processed_tasks += 1
@@ -103,6 +127,7 @@ class TensorRTWorkerThread(Thread, metaclass=LoggingMeta):
         with self.lock:
             stats_dict = {
                 "worker_id": self.worker_id,
+                "num_streams": self.num_streams,
                 "processed_tasks": self.processed_tasks,
                 "failed_tasks": self.failed_tasks,
                 "pending_tasks": self.pending_tasks_count(),
@@ -112,6 +137,10 @@ class TensorRTWorkerThread(Thread, metaclass=LoggingMeta):
 
     def stop(self) -> None:
         self._running = False
+
+        for stream in self.streams:
+            stream.synchronize()
+
         if self.is_alive():
             self.join(timeout=5.0)
             if self.is_alive():
@@ -122,7 +151,7 @@ class TensorRTWorkerThread(Thread, metaclass=LoggingMeta):
     def run(self) -> None:
         self._running = True
         nvtx.mark(f"Worker_{self.worker_id}_started")
-        self.logger.info(f"Worker {self.worker_id} started on stream {self.executor.cuda_stream.cuda_stream}")
+        self.logger.info(f"Worker {self.worker_id} started with {self.num_streams} streams")
 
         try:
             while self._running:
@@ -134,13 +163,18 @@ class TensorRTWorkerThread(Thread, metaclass=LoggingMeta):
             nvtx.mark(f"Worker_{self.worker_id}_finished")
             self.logger.info(f"Worker {self.worker_id} finished")
 
-    def _execute_inference(self, input_feed: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
-        with nvtx.annotate(f"Worker_{self.worker_id}_inference"):
+    def _execute_inference(self, input_feed: Dict[str, torch.Tensor], stream: torch.cuda.Stream) -> List[torch.Tensor]:
+        stream_name = f"Worker_{self.worker_id}_stream_{self.streams.index(stream)}"
+        with nvtx.annotate(f"{stream_name}_inference"):
             try:
-                results = self.executor.infer(input_feed, asynchronous=False)
-                return results
+                self.executor.cuda_stream = stream
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    # TODO: empty output in async mode after first iteration
+                    results = self.executor.infer(input_feed=input_feed, asynchronous=False)
+                    return results
             except Exception as error:
-                self.logger.error(f"Inference error in worker {self.worker_id}: {error}")
+                self.logger.error(f"Inference error in {stream_name}: {error}")
                 raise
 
     def __enter__(self):

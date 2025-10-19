@@ -6,12 +6,12 @@ import torch
 import threading
 from typing import Dict, List
 
-from base import TensorRTWorkerThread
+from base import WorkerThread
 from override import TensorRTExecutor
 from wrappers import nvtx
 
 
-class TensorRTPoolManager(object, metaclass=LoggingMeta):
+class PoolManager(object, metaclass=LoggingMeta):
     def __init__(
         self,
         model_path: str,
@@ -19,7 +19,9 @@ class TensorRTPoolManager(object, metaclass=LoggingMeta):
         num_workers: int = 2,
         device: str = "cuda:0",
         log_level: str = "ERROR",
-        enable_nvtx: bool = True
+        enable_nvtx: bool = True,
+        streams_per_worker: int = 1,
+        mixed_stream_config: List[int] = None
     ):
         self.model_path: str = model_path
         self.input_shapes: Dict[str, tuple] = input_shapes
@@ -27,8 +29,10 @@ class TensorRTPoolManager(object, metaclass=LoggingMeta):
         self.device: str = device
         self.log_level: str = log_level
         self.enable_nvtx: bool = enable_nvtx
+        self.streams_per_worker: int = streams_per_worker
+        self.mixed_stream_config: List[int] = mixed_stream_config
 
-        self.workers: List[TensorRTWorkerThread] = []
+        self.workers: List[WorkerThread] = []
         self.task_counter = 0
         self.worker_rotation = deque()
         self.lock = threading.RLock()
@@ -50,7 +54,7 @@ class TensorRTPoolManager(object, metaclass=LoggingMeta):
         with nvtx.annotate("wait_threads_events", color="red"):
             if completion_events:
                 for event in completion_events:
-                    torch.cuda.default_stream().wait_event(event)
+                    torch.cuda.current_stream().wait_event(event)
 
         with nvtx.annotate("push_results", color="green"):
             results = []
@@ -71,28 +75,47 @@ class TensorRTPoolManager(object, metaclass=LoggingMeta):
 
     @nvtx.annotate("initialize_worker_pool")
     def _initialize_workers(self) -> None:
-        self.logger.info(f"Initializing {self.num_workers} TensorRT workers...")
+        self.logger.info(
+            f"Initializing {self.num_workers} TensorRT workers with {self.streams_per_worker} streams each...")
 
         self.deserialized_model = TensorRTExecutor.load(
             self.model_path, self.device, self.log_level
         )
 
+        stream_configs = self._get_stream_configs()
+
         for i in range(self.num_workers):
-            worker = TensorRTWorkerThread(
+            num_streams = stream_configs[i] if i < len(stream_configs) else self.streams_per_worker
+
+            worker = WorkerThread(
                 executor=TensorRTExecutor.from_deserialized(self.deserialized_model),
                 device=self.device,
                 worker_id=i,
-                enable_nvtx=self.enable_nvtx
+                enable_nvtx=self.enable_nvtx,
+                num_streams=num_streams
             )
             self.workers.append(worker)
             self.worker_rotation.append(worker)
-        
+
         for worker in self.workers:
             worker.start()
-            
-        self.logger.info(f"TensorRT pool with {self.num_workers} workers ready")
 
-    def _get_next_worker(self) -> TensorRTWorkerThread:
+        total_streams = sum(worker.num_streams for worker in self.workers)
+        self.logger.info(f"TensorRT pool with {self.num_workers} workers and {total_streams} total streams ready")
+
+    def _get_stream_configs(self) -> List[int]:
+        if self.mixed_stream_config:
+            if len(self.mixed_stream_config) != self.num_workers:
+                self.logger.warning(
+                    f"Mixed stream config length ({len(self.mixed_stream_config)}) doesn't match number of "
+                    f"workers ({self.num_workers}). Using default."
+                )
+                return [self.streams_per_worker] * self.num_workers
+            return self.mixed_stream_config
+        else:
+            return [self.streams_per_worker] * self.num_workers
+
+    def _get_next_worker(self) -> WorkerThread:
         with self.lock:
             worker = self.worker_rotation[0]
             self.worker_rotation.rotate(-1)
@@ -164,21 +187,25 @@ class TensorRTPoolManager(object, metaclass=LoggingMeta):
 
         self.logger.info("All workers stopped")
 
-    def resize_pool(self, new_size: int):
+    def resize_pool(self, new_size: int, new_streams_per_worker: int = None):
         with self.lock:
-            if new_size == self.num_workers:
+            if new_size == self.num_workers and new_streams_per_worker is None:
                 return
 
             with nvtx.annotate(f"resize_pool_from_{self.num_workers}_to_{new_size}"):
                 self.logger.info(f"Resizing pool from {self.num_workers} to {new_size} workers")
 
+                if new_streams_per_worker is not None:
+                    self.streams_per_worker = new_streams_per_worker
+
                 if new_size > self.num_workers:
                     for i in range(self.num_workers, new_size):
-                        worker = TensorRTWorkerThread(
+                        worker = WorkerThread(
                             executor=TensorRTExecutor.from_deserialized(self.deserialized_model),
                             device=self.device,
                             worker_id=i,
-                            enable_nvtx=self.enable_nvtx
+                            enable_nvtx=self.enable_nvtx,
+                            num_streams=self.streams_per_worker
                         )
                         worker.start()
                         self.workers.append(worker)
@@ -194,7 +221,8 @@ class TensorRTPoolManager(object, metaclass=LoggingMeta):
 
                 self.num_workers = new_size
 
-                self.logger.info(f"Pool resized to {new_size} workers")
+                total_streams = sum(worker.num_streams for worker in self.workers)
+                self.logger.info(f"Pool resized to {new_size} workers with {total_streams} total streams")
 
     def get_pool_status(self) -> DictConfig:
         workers_stats = [worker.get_stats() for worker in self.workers]
@@ -202,12 +230,15 @@ class TensorRTPoolManager(object, metaclass=LoggingMeta):
         total_processed = sum(stats["processed_tasks"] for stats in workers_stats)
         total_failed = sum(stats["failed_tasks"] for stats in workers_stats)
         total_pending = sum(stats["pending_tasks"] for stats in workers_stats)
+        total_streams = sum(stats["num_streams"] for stats in workers_stats)
 
         uptime = time.time() - self.start_time
         throughput = total_processed / uptime if uptime > 0 else 0
 
         return OmegaConf.create({
             "total_workers": self.num_workers,
+            "total_streams": total_streams,
+            "streams_per_worker": self.streams_per_worker,
             "alive_workers": sum(1 for w in self.workers if w.is_alive()),
             "total_processed_tasks": total_processed,
             "total_failed_tasks": total_failed,

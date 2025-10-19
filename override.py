@@ -220,8 +220,10 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
     @nvtx_range()
     def _execute_async(self, is_new_api: bool) -> None:
         if is_new_api:
-            for node in self.bindings:
-                self.context.set_tensor_address(node, self.binding_address[node])
+            if self._refresh_addresses:
+                for node in self.bindings:
+                    self.context.set_tensor_address(node, self.binding_address[node])
+                self._refresh_addresses = False
             self.context.execute_async_v3(self.cuda_stream.cuda_stream)
         else:
             if not hasattr(self, "_cached_addresses") or self._refresh_addresses:
@@ -252,7 +254,8 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
     @nvtx_range()
     def _prepare_output_bindings(self, is_new_api: bool, input_feed: Dict[str, torch.Tensor]) -> None:
         for output_node in self.output_nodes:
-            if output_node not in self.bindings:
+            # TODO: here problem with random output
+            # if output_node not in self.bindings:
                 shape = self._get_output_shape(output_node, is_new_api)
                 if shape and all(dim > 0 for dim in shape):
                     dtype = self._get_tensor_dtype(output_node)
@@ -278,6 +281,7 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
             )
 
     @nvtx_range()
+    @torch.no_grad()
     def infer(self, input_feed: Dict[str, torch.Tensor], asynchronous: bool = False, **kwargs) -> List[torch.Tensor]:
         self._ensure_initialized()
 
