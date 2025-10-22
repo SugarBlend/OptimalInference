@@ -1,5 +1,10 @@
+import sys
+from pathlib import Path
+sys.path.append(Path(__file__).parent.parent.as_posix())
+
 import cv2
 import click
+import nvtx
 from deploy2serve.utils.logger import get_logger
 import glob
 from mmcv.visualization.image import imshow_det_bboxes
@@ -42,7 +47,8 @@ class YoloProcessor(object):
 
 
 @click.command()
-@click.option("--frames-folder", type=str, help="Path to file which consider labels in coco format.")
+@click.option("--frames-folder", default="D:\dance_dataset_2\stable\images", type=str,
+              help="Path to file which consider labels in coco format.")
 def simple_launch(frames_folder):
     logger = get_logger("benchmark")
     processor = YoloProcessor((384, 640))
@@ -51,12 +57,13 @@ def simple_launch(frames_folder):
         input_shapes={"images": (1, 3, 384, 640), "output": (1, 84, 5040)},
         num_workers=1,
         device="cuda:0",
-        streams_per_worker=1
+        streams_per_worker=4
     )
 
     try:
-        frames = glob.glob(f"{frames_folder}/*")[:10]
-        inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
+        with nvtx.annotate("create placeholders"):
+            frames = glob.glob(f"{frames_folder}/*")[:1000]
+            inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
 
         start_time = time.time()
         worker_task_pairs = pool.submit_batch(inputs)
@@ -70,7 +77,6 @@ def simple_launch(frames_folder):
         logger.info(f"Throughput: {successful / total_time:.2f} inferences/sec")
         status = pool.get_pool_status()
         logger.info(f"Pool status: {status}")
-
         for idx, result in enumerate(results):
             image = cv2.imread(frames[idx])
 

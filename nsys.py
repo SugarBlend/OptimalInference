@@ -13,7 +13,7 @@ class Mode(str, Enum):
 
 
 @click.command()
-@click.option("--profiling-file", type=str, default="experiments/demo.py", help="File for start testing.")
+@click.option("--profiling-file", type=str, default="experiments/benchmark.py", help="File for start testing.")
 @click.option("--output-name", type=str, default="demo", help="Stem of output files with profiling info.")
 @click.option(
     "--mode", type=Mode, default=Mode.Full, 

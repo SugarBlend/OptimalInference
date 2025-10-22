@@ -107,6 +107,8 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
         self.device: str = device
         self.enable_nvtx: bool = enable_nvtx
 
+        self.is_new_api = version.parse(trt.__version__) >= version.parse("9.1.0")
+
         self.cuda_stream = torch.cuda.Stream(device=device)
         self.bindings: OrderedDict[str, Binding] = OrderedDict()
         self.binding_address: OrderedDict[str, int] = OrderedDict()
@@ -132,7 +134,7 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
 
         if version.parse("8.2.5.1") <= trt_version <= version.parse("8.6.1"):
             adapter = TensorRTAPIAdapter(self.model, legacy_mode=True)
-        elif trt_version >= version.parse("9.1.0"):
+        elif self.is_new_api:
             adapter = TensorRTAPIAdapter(self.model, legacy_mode=False)
         else:
             raise NotImplementedError(f"TensorRT version {trt.__version__} not supported")
@@ -183,7 +185,7 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
 
         if version.parse("8.2.5.1") <= trt_version <= version.parse("8.6.1"):
             adapter = TensorRTAPIAdapter(self.model, legacy_mode=True)
-        elif trt_version >= version.parse("9.1.0"):
+        elif self.is_new_api:
             adapter = TensorRTAPIAdapter(self.model, legacy_mode=False)
         else:
             raise NotImplementedError(f"Your version of TensorRT: {trt.__version__} is not implemented")
@@ -218,12 +220,11 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
         return None
 
     @nvtx_range()
-    def _execute_async(self, is_new_api: bool) -> None:
-        if is_new_api:
-            if self._refresh_addresses:
-                for node in self.bindings:
-                    self.context.set_tensor_address(node, self.binding_address[node])
-                self._refresh_addresses = False
+    def _execute_async(self) -> None:
+        if self.is_new_api:
+            ret = all(map(lambda node: self.context.set_tensor_address(node, self.binding_address[node]), self.bindings))
+            if not ret:
+                raise RuntimeError("Failed to set tensor addresses!")
             self.context.execute_async_v3(self.cuda_stream.cuda_stream)
         else:
             if not hasattr(self, "_cached_addresses") or self._refresh_addresses:
@@ -238,6 +239,22 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
                 stream_handle=self.cuda_stream.cuda_stream)
 
     @nvtx_range()
+    def _execute_sync(self) -> None:
+        if not hasattr(self, "_cached_addresses") or self._refresh_addresses:
+            trt_version = version.parse(trt.__version__)
+            if version.parse("8.2.5.1") <= trt_version <= version.parse("8.6.1"):
+                adapter = TensorRTAPIAdapter(self.model, legacy_mode=True)
+            elif trt_version >= version.parse("9.1.0"):
+                adapter = TensorRTAPIAdapter(self.model, legacy_mode=False)
+
+            self._cached_addresses = [
+                self.binding_address.get(adapter.get_name(i))
+                for i in range(adapter.tensor_count)
+            ]
+            self._refresh_addresses = False
+        self.context.execute_v2(list(self.binding_address.values()))
+
+    @nvtx_range()
     def _get_tensor_dtype(self, name: str) -> type:
         trt_version = version.parse(trt.__version__)
 
@@ -245,28 +262,26 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
             adapter = TensorRTAPIAdapter(self.model, legacy_mode=True)
             idx = self._get_binding_index(name)
             return adapter.get_dtype(idx) if idx is not None else np.float32
-        elif trt_version >= version.parse("9.1.0"):
+        elif self.is_new_api:
             adapter = TensorRTAPIAdapter(self.model, legacy_mode=False)
             return adapter.get_dtype(name)
         else:
             return np.float32
 
     @nvtx_range()
-    def _prepare_output_bindings(self, is_new_api: bool, input_feed: Dict[str, torch.Tensor]) -> None:
+    def _prepare_output_bindings(self) -> None:
         for output_node in self.output_nodes:
-            # TODO: here problem with random output
-            # if output_node not in self.bindings:
-                shape = self._get_output_shape(output_node, is_new_api)
-                if shape and all(dim > 0 for dim in shape):
-                    dtype = self._get_tensor_dtype(output_node)
-                    self.bindings[output_node] = self._make_binding(
-                        output_node, dtype, list(shape), "output", self.device
-                    )
-                    self.binding_address[output_node] = self.bindings[output_node].ptr
+            shape = self._get_output_shape(output_node)
+            if shape and all(dim > 0 for dim in shape):
+                dtype = self._get_tensor_dtype(output_node)
+                self.bindings[output_node] = self._make_binding(
+                    output_node, dtype, list(shape), "output", self.device
+                )
+                self.binding_address[output_node] = self.bindings[output_node].ptr
 
     @nvtx_range()
-    def _get_output_shape(self, name: str, is_new_api: bool) -> Tuple[int, ...]:
-        if is_new_api:
+    def _get_output_shape(self, name: str) -> Tuple[int, ...]:
+        if self.is_new_api:
             return tuple(self.context.get_tensor_shape(name))
         else:
             idx = self._get_binding_index(name)
@@ -285,12 +300,12 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
     def infer(self, input_feed: Dict[str, torch.Tensor], asynchronous: bool = False, **kwargs) -> List[torch.Tensor]:
         self._ensure_initialized()
 
+        self.cuda_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.cuda_stream):
             with nvtx.annotate(f"update_input_bindings.{self.num_inferences}", color="green"):
                 input_shapes = {node: input_feed[node].shape for node in input_feed}
                 self.update_bindings(input_shapes)
 
-                is_new_api = version.parse(trt.__version__) >= version.parse("9.1.0")
                 for node in input_feed:
                     if (
                         input_feed[node].device != torch.device(self.device) or
@@ -304,7 +319,7 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
                         ).contiguous()
                     self.binding_address[node] = int(input_feed[node].data_ptr())
 
-                    if is_new_api:
+                    if self.is_new_api:
                         self.context.set_input_shape(node, input_feed[node].shape)
                     else:
                         binding_index = self._get_binding_index(node)
@@ -312,25 +327,13 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
                             self.context.set_binding_shape(binding_index, input_feed[node].shape)
 
             with nvtx.annotate(f"prepare_output_bindings.{self.num_inferences}", color="red"):
-                self._prepare_output_bindings(is_new_api, input_feed)
+                self._prepare_output_bindings()
 
             with nvtx.annotate(f"tensorrt_execute.{self.num_inferences}", color="blue"):
                 if asynchronous:
-                    self._execute_async(is_new_api)
+                    self._execute_async()
                 else:
-                    if not hasattr(self, "_cached_addresses") or self._refresh_addresses:
-                        trt_version = version.parse(trt.__version__)
-                        if version.parse("8.2.5.1") <= trt_version <= version.parse("8.6.1"):
-                            adapter = TensorRTAPIAdapter(self.model, legacy_mode=True)
-                        elif trt_version >= version.parse("9.1.0"):
-                            adapter = TensorRTAPIAdapter(self.model, legacy_mode=False)
-
-                        self._cached_addresses = [
-                            self.binding_address.get(adapter.get_name(i))
-                            for i in range(adapter.tensor_count)
-                        ]
-                        self._refresh_addresses = False
-                    self.context.execute_v2(list(self.binding_address.values()))
+                    self._execute_sync()
 
             self.num_inferences += 1
-        return [self.bindings[node].data for node in self.output_nodes]
+            return [self.bindings[node].data for node in self.output_nodes]

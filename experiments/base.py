@@ -170,8 +170,7 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
                 self.executor.cuda_stream = stream
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
-                    # TODO: empty output in async mode after first iteration
-                    results = self.executor.infer(input_feed=input_feed, asynchronous=False)
+                    results = self.executor.infer(input_feed=input_feed, asynchronous=True)
                     return results
             except Exception as error:
                 self.logger.error(f"Inference error in {stream_name}: {error}")
