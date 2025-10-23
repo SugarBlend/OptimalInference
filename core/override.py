@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from deploy2serve.deployment.core.executors.base import BaseExecutor, ExecutorFactory
 from deploy2serve.deployment.models.common import Backend
 from deploy2serve.utils.logger import get_logger
-from wrappers import nvtx_range
+from utils.wrappers import nvtx_range
 import nvtx
 
 
@@ -252,7 +252,10 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
                 for i in range(adapter.tensor_count)
             ]
             self._refresh_addresses = False
-        self.context.execute_v2(list(self.binding_address.values()))
+
+        torch.cuda.default_stream().wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.cuda_stream):
+            self.context.execute_v2(list(self.binding_address.values()))
 
     @nvtx_range()
     def _get_tensor_dtype(self, name: str) -> type:

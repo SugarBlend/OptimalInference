@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-sys.path.append(Path(__file__).parent.parent.as_posix())
+sys.path.insert(0, Path(__file__).parents[2].as_posix())
 
 import cv2
 import click
@@ -16,7 +16,7 @@ from ultralytics.data.augment import LetterBox
 from ultralytics.utils.ops import scale_boxes
 from ultralytics.utils.nms import non_max_suppression
 
-from pool_manager import PoolManager
+from core.pool_manager import PoolManager
 
 
 class YoloProcessor(object):
@@ -47,7 +47,7 @@ class YoloProcessor(object):
 
 
 @click.command()
-@click.option("--frames-folder", default="D:\dance_dataset_2\stable\images", type=str,
+@click.option("--frames-folder", default="../images", type=str,
               help="Path to file which consider labels in coco format.")
 def simple_launch(frames_folder):
     logger = get_logger("benchmark")
@@ -55,14 +55,15 @@ def simple_launch(frames_folder):
     pool = PoolManager(
         model_path="../checkpoints/yolo/tensorrt/model.plan",
         input_shapes={"images": (1, 3, 384, 640), "output": (1, 84, 5040)},
-        num_workers=1,
+        num_workers=4,
         device="cuda:0",
-        streams_per_worker=4
+        streams_per_worker=1,
+        asynchronous=True
     )
 
     try:
         with nvtx.annotate("create placeholders"):
-            frames = glob.glob(f"{frames_folder}/*")[:1000]
+            frames = glob.glob(f"{frames_folder}/*")
             inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
 
         start_time = time.time()

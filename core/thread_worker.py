@@ -5,7 +5,7 @@ import torch
 from threading import Thread, Lock
 from typing import Dict, List, Optional, Tuple
 from omegaconf import OmegaConf, DictConfig
-from override import BaseExecutor
+from core.override import BaseExecutor
 import threading
 import nvtx
 from collections import deque
@@ -19,7 +19,8 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         worker_id: int = 0,
         daemon: bool = True,
         enable_nvtx: bool = True,
-        num_streams: int = 1
+        num_streams: int = 1,
+        asynchronous: bool = False
     ):
         super().__init__(
             name=f"TRT-Worker-{worker_id}-{num_streams}streams",
@@ -33,6 +34,7 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         self.device: str = device
         self.enable_nvtx: bool = enable_nvtx
         self.num_streams: int = num_streams
+        self.asynchronous: bool = asynchronous
 
         self.streams: List[torch.cuda.Stream] = []
         self._initialize_streams()
@@ -170,7 +172,7 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
                 self.executor.cuda_stream = stream
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
-                    results = self.executor.infer(input_feed=input_feed, asynchronous=True)
+                    results = self.executor.infer(input_feed=input_feed, asynchronous=self.asynchronous)
                     return results
             except Exception as error:
                 self.logger.error(f"Inference error in {stream_name}: {error}")

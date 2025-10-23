@@ -4,6 +4,7 @@ import nvtx
 
 F = TypeVar("F", bound=Callable[..., Any])
 
+
 def nvtx_range(func: Optional[F] = None, name: Optional[str] = None) -> Callable[[F], F] | F:
     def decorator(func: F) -> F:
         @wraps(func)

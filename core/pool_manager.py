@@ -6,9 +6,9 @@ import torch
 import threading
 from typing import Dict, List
 
-from base import WorkerThread
-from override import TensorRTExecutor
-from wrappers import nvtx
+from core.thread_worker import WorkerThread
+from core.override import TensorRTExecutor
+from utils.wrappers import nvtx
 
 
 class PoolManager(object, metaclass=LoggingMeta):
@@ -21,7 +21,8 @@ class PoolManager(object, metaclass=LoggingMeta):
         log_level: str = "ERROR",
         enable_nvtx: bool = True,
         streams_per_worker: int = 1,
-        mixed_stream_config: List[int] = None
+        mixed_stream_config: List[int] = None,
+        asynchronous: bool = False
     ):
         self.model_path: str = model_path
         self.input_shapes: Dict[str, tuple] = input_shapes
@@ -31,6 +32,7 @@ class PoolManager(object, metaclass=LoggingMeta):
         self.enable_nvtx: bool = enable_nvtx
         self.streams_per_worker: int = streams_per_worker
         self.mixed_stream_config: List[int] = mixed_stream_config
+        self.asynchronous: bool = asynchronous
 
         self.workers: List[WorkerThread] = []
         self.task_counter = 0
@@ -92,7 +94,8 @@ class PoolManager(object, metaclass=LoggingMeta):
                 device=self.device,
                 worker_id=i,
                 enable_nvtx=self.enable_nvtx,
-                num_streams=num_streams
+                num_streams=num_streams,
+                asynchronous=self.asynchronous
             )
             self.workers.append(worker)
             self.worker_rotation.append(worker)
@@ -205,7 +208,8 @@ class PoolManager(object, metaclass=LoggingMeta):
                             device=self.device,
                             worker_id=i,
                             enable_nvtx=self.enable_nvtx,
-                            num_streams=self.streams_per_worker
+                            num_streams=self.streams_per_worker,
+                            asynchronous=self.asynchronous
                         )
                         worker.start()
                         self.workers.append(worker)
