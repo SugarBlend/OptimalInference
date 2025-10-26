@@ -1,0 +1,37 @@
+[project]
+name = "acceleratedinference"
+version = "0.1.0"
+description = "..."
+readme = "README.md"
+requires-python = ">=3.10.11"
+dependencies = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "onnxruntime-gpu",
+    "colorlog",
+    "opencv-python",
+    "numpy>=2.2.6",
+    "kornia>=0.8.1",
+    "ultralytics==8.3.170",
+    "tensorrt==10.10.0.31",
+    "pytest",
+    "pytest-repeat",
+    "packaging",
+    "click",
+    "omegaconf>=1.2.1",
+    "pydantic>=2.9.0",
+    "nvtx==0.2.13"
+]
+
+[tool.uv]
+default-groups = "all"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

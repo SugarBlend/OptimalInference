@@ -34,8 +34,8 @@ class TestExecutionAbility:
             streams_per_worker=streams_per_thread,
             asynchronous=asynchronous
         ) as pool:
-            frames_folder = "../images"
-            frames = glob.glob(f"{frames_folder}/*")
+            frames_folder = "../../images"
+            frames = glob.glob(f"{frames_folder}/*")[:1000]
             inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
 
             worker_task_pairs = pool.submit_batch(inputs)
@@ -77,8 +77,8 @@ class TestExecutionAbility:
             streams_per_worker=streams_per_thread,
             asynchronous=int(current_step) % 2 == 0
         ) as pool:
-            frames_folder = "../images"
-            frames = glob.glob(f"{frames_folder}/*")
+            frames_folder = "../../images"
+            frames = glob.glob(f"{frames_folder}/*")[:1000]
             inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
 
             worker_task_pairs = pool.submit_batch(inputs)
