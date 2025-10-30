@@ -13,8 +13,8 @@ from utils.env import get_project_root
 
 class TestExecutionAbility:
     @pytest.mark.parametrize("asynchronous", [True, False])
-    @pytest.mark.parametrize("threads_number", [1, 2, 4])
-    @pytest.mark.parametrize("streams_per_thread", [1])
+    @pytest.mark.parametrize("threads_number", [1, 4])
+    @pytest.mark.parametrize("streams_per_thread", [1, 4])
     @pytest.mark.repeat(3)
     def test_multi_thread(
         self,
@@ -58,7 +58,7 @@ class TestExecutionAbility:
         torch.cuda.empty_cache()
 
     @pytest.mark.parametrize("threads_number", [1, 4])
-    @pytest.mark.parametrize("streams_per_thread", [1])
+    @pytest.mark.parametrize("streams_per_thread", [1, 4])
     @pytest.mark.repeat(6)
     def test_modes_similarity(
         self,

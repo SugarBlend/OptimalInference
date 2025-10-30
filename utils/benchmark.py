@@ -10,12 +10,13 @@ import glob
 import numpy as np
 import torch
 import time
-from typing import Tuple, List, Union, Optional
+from typing import Tuple, List, Optional
 from ultralytics.data.augment import LetterBox
 from ultralytics.utils.ops import scale_boxes
 from ultralytics.utils.ops import non_max_suppression
 
 from core.pool_manager import PoolManager
+from utils.env import get_project_root
 
 
 def imshow_det_bboxes(img: np.ndarray,
@@ -116,23 +117,25 @@ class YoloProcessor(object):
 
 
 @click.command()
-@click.option("--frames-folder", default="../images", type=str,
+@click.option("--frames-folder", default=f"{get_project_root()}/images", type=str,
               help="Path to file which consider labels in coco format.")
-def simple_launch(frames_folder):
+@click.option("--no-preview", is_flag=True, default=True,
+              help="Disable to show results.")
+def simple_launch(frames_folder, no_preview):
     logger = get_logger("benchmark")
     processor = YoloProcessor((384, 640))
     pool = PoolManager(
-        model_path="../checkpoints/yolo/tensorrt/model.plan",
+        model_path=f"{get_project_root()}/checkpoints/yolo/tensorrt/model.plan",
         input_shapes={"images": (1, 3, 384, 640), "output": (1, 84, 5040)},
-        num_workers=4,
+        num_workers=1,
         device="cuda:0",
-        streams_per_worker=1,
+        streams_per_worker=4,
         asynchronous=True
     )
 
     try:
         with nvtx.annotate("create placeholders"):
-            frames = glob.glob(f"{frames_folder}/*")
+            frames = glob.glob(f"{frames_folder}/*")[:1000]
             inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
 
         start_time = time.time()
@@ -147,15 +150,16 @@ def simple_launch(frames_folder):
         logger.info(f"Throughput: {successful / total_time:.2f} inferences/sec")
         status = pool.get_pool_status()
         logger.info(f"Pool status: {status}")
-        for idx, result in enumerate(results):
-            image = cv2.imread(frames[idx])
+        if not no_preview:
+            for idx, result in enumerate(results):
+                image = cv2.imread(frames[idx])
 
-            boxes, scores, classes = processor.postprocess(result, image.shape[:2])
-            if len(boxes):
-                imshow_det_bboxes(
-                    image.copy(), np.concatenate([boxes[0], scores[0]], axis=1), classes[0],
-                    bbox_color=(0, 233, 255), text_color=(0, 233, 255), thickness=2, show=True,
-                )
+                boxes, scores, classes = processor.postprocess(result, image.shape[:2])
+                if len(boxes):
+                    imshow_det_bboxes(
+                        image.copy(), np.concatenate([boxes[0], scores[0]], axis=1), classes[0],
+                        bbox_color=(0, 233, 255), text_color=(0, 233, 255), thickness=2, show=True,
+                    )
 
     except KeyboardInterrupt:
         logger.warning("Stopping...")
