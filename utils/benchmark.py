@@ -119,7 +119,7 @@ class YoloProcessor(object):
 @click.command()
 @click.option("--frames-folder", default=f"{get_project_root()}/images", type=str,
               help="Path to file which consider labels in coco format.")
-@click.option("--no-preview", is_flag=True, default=True,
+@click.option("--no-preview", is_flag=True, default=False,
               help="Disable to show results.")
 def simple_launch(frames_folder, no_preview):
     logger = get_logger("benchmark")
@@ -129,8 +129,9 @@ def simple_launch(frames_folder, no_preview):
         input_shapes={"images": (1, 3, 384, 640), "output": (1, 84, 5040)},
         num_workers=1,
         device="cuda:0",
-        streams_per_worker=4,
-        asynchronous=True
+        streams_per_worker=1,
+        asynchronous=True,
+        use_graph=True,
     )
 
     try:

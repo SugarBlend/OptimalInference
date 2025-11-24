@@ -22,7 +22,8 @@ class PoolManager(object, metaclass=LoggingMeta):
         enable_nvtx: bool = True,
         streams_per_worker: int = 1,
         mixed_stream_config: List[int] = None,
-        asynchronous: bool = False
+        asynchronous: bool = False,
+        use_graph: bool = False
     ):
         self.model_path: str = model_path
         self.input_shapes: Dict[str, tuple] = input_shapes
@@ -33,6 +34,7 @@ class PoolManager(object, metaclass=LoggingMeta):
         self.streams_per_worker: int = streams_per_worker
         self.mixed_stream_config: List[int] = mixed_stream_config
         self.asynchronous: bool = asynchronous
+        self.use_graph: bool = use_graph
 
         self.workers: List[WorkerThread] = []
         self.task_counter = 0
@@ -95,7 +97,8 @@ class PoolManager(object, metaclass=LoggingMeta):
                 worker_id=i,
                 enable_nvtx=self.enable_nvtx,
                 num_streams=num_streams,
-                asynchronous=self.asynchronous
+                asynchronous=self.asynchronous,
+                use_graph=self.use_graph
             )
             self.workers.append(worker)
             self.worker_rotation.append(worker)
