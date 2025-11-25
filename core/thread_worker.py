@@ -1,14 +1,16 @@
+from contextlib import nullcontext
+from collections import deque
 from deploy2serve.deployment.models.common import LoggingMeta
+from omegaconf import OmegaConf, DictConfig
+import nvtx
 from queue import Queue, Empty
 import time
 import torch
-from threading import Thread, Lock
-from typing import Dict, List, Optional, Tuple
-from omegaconf import OmegaConf, DictConfig
-from core.override import BaseExecutor
+from threading import Thread, Lock, Barrier
+from typing import Dict, List, Optional, Tuple, Union
 import threading
-import nvtx
-from collections import deque
+
+from core.override import BaseExecutor
 
 
 class WorkerThread(Thread, metaclass=LoggingMeta):
@@ -21,7 +23,10 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         enable_nvtx: bool = True,
         num_streams: int = 1,
         asynchronous: bool = False,
-        use_graph: bool = False
+        use_graph: bool = False,
+        capture_barrier: Optional[Barrier] = None,
+        mutex: Union[nullcontext, Lock] = nullcontext(),
+        use_unique_context: bool = False
     ):
         super().__init__(
             name=f"TRT-Worker-{worker_id}-{num_streams}streams",
@@ -37,6 +42,9 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         self.num_streams: int = num_streams
         self.asynchronous: bool = asynchronous
         self.use_graph: bool = use_graph
+        self.capture_barrier: Optional[Barrier] = capture_barrier
+        self.mutex: Union[nullcontext, Lock] = mutex
+        self.use_unique_context: bool = use_unique_context
 
         self.streams: List[torch.cuda.Stream] = []
         self._initialize_streams()
@@ -172,11 +180,10 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         with nvtx.annotate(f"{stream_name}_inference"):
             try:
                 self.executor.cuda_stream = stream
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    results = self.executor.infer(input_feed=input_feed, asynchronous=self.asynchronous,
-                                                  use_graph=self.use_graph)
-                    return results
+                results = self.executor.infer(input_feed=input_feed, asynchronous=self.asynchronous,
+                                              use_graph=self.use_graph, capture_barrier=self.capture_barrier,
+                                              use_unique_context=self.use_unique_context, mutex=self.mutex)
+                return results
             except Exception as error:
                 self.logger.error(f"Inference error in {stream_name}: {error}")
                 raise

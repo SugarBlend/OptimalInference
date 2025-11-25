@@ -1,7 +1,9 @@
 import sys
+import threading
 from pathlib import Path
 sys.path.insert(0, Path(__file__).parents[2].as_posix())
 
+from tqdm import tqdm
 import cv2
 import click
 import nvtx
@@ -11,12 +13,13 @@ import numpy as np
 import torch
 import time
 from typing import Tuple, List, Optional
-from ultralytics.data.augment import LetterBox
 from ultralytics.utils.ops import scale_boxes
 from ultralytics.utils.ops import non_max_suppression
+from turbojpeg import TurboJPEG
 
 from core.pool_manager import PoolManager
 from utils.env import get_project_root
+from concurrent.futures import ThreadPoolExecutor
 
 
 def imshow_det_bboxes(img: np.ndarray,
@@ -92,15 +95,72 @@ def imshow_det_bboxes(img: np.ndarray,
 class YoloProcessor(object):
     def __init__(self, input_shape: Tuple[int, int]) -> None:
         self.input_shape: Tuple[int, int] = input_shape
-        self.letterbox = LetterBox(new_shape=input_shape)
+        self.input: Optional[torch.Tensor] = None
+
+    @staticmethod
+    @torch.jit.script
+    def letterbox(
+        image: torch.Tensor,
+        new_shape: Tuple[int, int],
+        color: Tuple[int, int, int] = (114, 114, 114),
+        auto: bool = False,
+        scaleup: bool = True,
+        stride: int = 32
+    ) -> Tuple[torch.Tensor, float, Tuple[float, float]]:
+        # Resize and pad image while meeting stride-multiple constraints
+        shape = image.shape[:2]  # current shape [height, width]
+
+        # Scale ratio (new / old)
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        if not scaleup:  # only scale down, do not scale up (for better test mAP)
+            r = min(r, 1.0)
+
+        # Compute padding
+        new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+        dw = float(new_shape[1] - new_unpad[0])
+        dh = float(new_shape[0] - new_unpad[1])
+
+        if auto:
+            dw = torch.remainder(torch.tensor(dw), stride).item()
+            dh = torch.remainder(torch.tensor(dh), stride).item()
+
+        dw /= 2
+        dh /= 2
+
+        top = int(torch.round(torch.tensor(dh - 0.1)).item())
+        bottom = int(torch.round(torch.tensor(dh + 0.1)).item())
+        left = int(torch.round(torch.tensor(dw - 0.1)).item())
+        right = int(torch.round(torch.tensor(dw + 0.1)).item())
+
+        image = image.permute(2, 0, 1)
+        image = image.unsqueeze(0).float()
+
+        if shape[::-1] != new_unpad:
+            image = torch.nn.functional.interpolate(
+                image,
+                size=new_unpad[::-1],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        if left > 0 or right > 0 or top > 0 or bottom > 0:
+            image = torch.nn.functional.pad(
+                image,
+                pad=(left, right, top, bottom),
+                mode="constant",
+                value=float(color[0]) / 255.0
+            )
+
+        image = image[:, [2, 1, 0]].contiguous()
+
+        return image / 255., r, (dw, dh)
 
     def preprocess(self, image: np.ndarray) -> torch.Tensor:
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        preprocessed = torch.from_numpy(self.letterbox(image=image)).to("cuda:0")
-        preprocessed = preprocessed.permute(2, 0, 1)
-        preprocessed = preprocessed / 255.0
-        preprocessed = preprocessed.half()
-        return preprocessed[None]
+        if self.input is None:
+            self.input = torch.from_numpy(image).cuda()
+        else:
+            self.input.copy_(torch.from_numpy(image))
+        return self.letterbox(self.input, self.input_shape)[0]
 
     def postprocess(
         self, output: torch.Tensor, orig_shape
@@ -119,25 +179,48 @@ class YoloProcessor(object):
 @click.command()
 @click.option("--frames-folder", default=f"{get_project_root()}/images", type=str,
               help="Path to file which consider labels in coco format.")
-@click.option("--no-preview", is_flag=True, default=False,
+@click.option("--no-preview", is_flag=True, default=True,
               help="Disable to show results.")
 def simple_launch(frames_folder, no_preview):
     logger = get_logger("benchmark")
     processor = YoloProcessor((384, 640))
-    pool = PoolManager(
-        model_path=f"{get_project_root()}/checkpoints/yolo/tensorrt/model.plan",
-        input_shapes={"images": (1, 3, 384, 640), "output": (1, 84, 5040)},
-        num_workers=1,
-        device="cuda:0",
-        streams_per_worker=1,
-        asynchronous=True,
-        use_graph=True,
-    )
+
+    with nvtx.annotate("create pool object"):
+        pool = PoolManager(
+            model_path=f"{get_project_root()}/checkpoints/yolo/tensorrt/model.plan",
+            input_shapes={"images": (1, 3, 384, 640), "output": (1, 84, 5040)},
+            num_workers=10,
+            device="cuda:0",
+            streams_per_worker=1,
+            asynchronous=True,
+            use_graph=True,
+            use_unique_context=True,
+            mutex=threading.Lock()
+        )
 
     try:
-        with nvtx.annotate("create placeholders"):
-            frames = glob.glob(f"{frames_folder}/*")[:1000]
-            inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
+        jpeg = TurboJPEG(r"E:\SDK\libjpeg-turbo-gcc64\bin\libturbojpeg.dll")
+
+        def img_decode(path: str) -> np.ndarray:
+            with open(path, "rb") as file:
+                return jpeg.decode(file.read())
+
+        def threaded_read(frames: List[str], num_workers: int = 8, batch_size: int = 50) -> List[np.ndarray]:
+            total_frames = len(frames)
+            all_images: List[np.ndarray] = []
+
+            with tqdm(total=total_frames, desc="Loading frames") as pbar:
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    for i in range(0, total_frames, batch_size):
+                        batch_paths = frames[i:i + batch_size]
+                        batch_images = list(executor.map(img_decode, batch_paths))
+                        all_images.extend(batch_images)
+                        pbar.update(len(batch_images))
+            return all_images
+
+        frames = glob.glob(f"{frames_folder}/*")[:1000]
+        images = threaded_read(frames, num_workers=8, batch_size=50)
+        inputs = [{'images': processor.preprocess(img)} for img in images]
 
         start_time = time.time()
         worker_task_pairs = pool.submit_batch(inputs)

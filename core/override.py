@@ -1,93 +1,18 @@
 from collections import OrderedDict
 from contextlib import nullcontext
+from packaging import version
 from pathlib import Path
-from typing import List, Literal, Tuple, Union, Dict, Optional, Any
-
-import numpy as np
+from typing import List, Tuple, Union, Dict, Optional
 import tensorrt as trt
 import torch
-from packaging import version
-from pydantic import BaseModel, Field
+from threading import Lock, Barrier
 
 from deploy2serve.deployment.core.executors.base import BaseExecutor, ExecutorFactory
 from deploy2serve.deployment.models.common import Backend
 from deploy2serve.utils.logger import get_logger
 from utils.wrappers import nvtx_range
 import nvtx
-
-
-class TensorRTAPIAdapter(object):
-    def __init__(self, model: trt.ICudaEngine, legacy_mode: bool) -> None:
-        self.model: trt.ICudaEngine = model
-        self.legacy_mode: bool = legacy_mode
-
-    @property
-    def tensor_count(self) -> int:
-        return self.model.num_bindings if self.legacy_mode else self.model.num_io_tensors
-
-    def get_name(self, index: int) -> str:
-        return self.model.get_binding_name(index) if self.legacy_mode else self.model.get_tensor_name(index)
-
-    def get_dtype(self, index_or_name: Union[str, int]) -> type:
-        if self.legacy_mode:
-            return trt.nptype(self.model.get_binding_dtype(index_or_name))
-        else:
-            return trt.nptype(self.model.get_tensor_dtype(index_or_name))
-
-    def get_shape(self, index_or_name: Union[str, int]) -> Tuple[int, ...]:
-        if self.legacy_mode:
-            return self.model.get_binding_shape(index_or_name)
-        else:
-            return self.model.get_tensor_shape(index_or_name)
-
-    def is_input(self, index_or_name: Union[str, int]) -> bool:
-        if self.legacy_mode:
-            return self.model.binding_is_input(index_or_name)
-        else:
-            return self.model.get_tensor_mode(index_or_name) == trt.TensorIOMode.INPUT
-
-
-class TensorMetadata(BaseModel):
-    name: str = Field(description="Name of node in tensorrt graph.")
-    dtype: Any = Field(description="Data type for current node name.")
-    shape: Union[Tuple[int, ...], List[int]] = Field(description="Current static shape for this node.")
-    is_input: bool = Field(description="Is the node an input node?")
-
-    def __init__(
-        self,
-        name: str,
-        dtype: Any,
-        shape: Tuple[int, ...],
-        is_input: bool,
-    ) -> None:
-        dtype = getattr(torch, dtype.__name__)
-        super().__init__(name=name, dtype=dtype, shape=shape, is_input=is_input)
-
-    class Config:
-        arbitrary_types_allowed = True
-
-
-class TensorBinding(object):
-    def __init__(self, metadata: TensorMetadata, tensor: torch.Tensor):
-        self.metadata: TensorMetadata = metadata
-        self.tensor: torch.Tensor = tensor
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.tensor.dtype
-
-    @property
-    def shape(self) -> Tuple[int, ...]:
-        return tuple(self.tensor.shape)
-
-    @property
-    def ptr(self) -> int:
-        return int(self.tensor.data_ptr())
-
-    @classmethod
-    def create(cls, metadata: TensorMetadata, device: str) -> 'TensorBinding':
-        tensor = torch.zeros(metadata.shape, dtype=metadata.dtype, device=device)
-        return cls(metadata, tensor)
+from utils.bindings import TensorBinding, TensorMetadata, TensorRTAPIAdapter
 
 
 class LoggingMixin:
@@ -116,7 +41,6 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
             else:
                 self.checkpoints_path: str = checkpoints_path
             self.model = self.load(checkpoints_path, device)
-            self.context = self.get_context()
             self._initialize_io_nodes()
         else:
             self.logger.info("There are no weights available, loading is expected to be done separately.")
@@ -136,17 +60,21 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
         self.bindings: OrderedDict[int, OrderedDict[str, TensorBinding]] = OrderedDict()
         self.num_inferences: Dict[int, int] = {}
         self.input_tensors: Dict[str, Dict[str, torch.Tensor]] = {}
+        #TODO: Extend to use in case when have got several optimization profiles
+        self.contexts: Dict[int, trt.IExecutionContext] = {}
+        self.addresses: List[int] = []
 
         self.input_nodes: List[str] = []
         self.output_nodes: List[str] = []
         self.nvtx_marker = nvtx_range if enable_nvtx else nullcontext
         self._last_input_shapes: Dict[str, Tuple[int, ...]] = {}
 
+        self.context: Optional[trt.IExecutionContext] = None
+
     @classmethod
     def from_deserialized(cls, model: trt.ICudaEngine, device: str = "cuda:0") -> "TensorRTExecutor":
         instance = cls()
         instance.model = model
-        instance.context = instance.get_context()
         instance._initialize_io_nodes()
         return instance
 
@@ -287,12 +215,23 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
         input_feed: Dict[str, torch.Tensor],
         asynchronous: bool = False,
         use_graph: bool = False,
+        capture_barrier: Optional[Barrier] = None,
+        use_unique_context: bool = False,
+        mutex: Union[nullcontext, Lock] = nullcontext(),
         **kwargs
     ) -> List[torch.Tensor]:
-        self._ensure_initialized()
+        if use_unique_context:
+            if not self.contexts.get(self.cuda_stream.cuda_stream):
+                self.contexts[self.cuda_stream.cuda_stream] = self.get_context()
+            self.context = self.contexts[self.cuda_stream.cuda_stream]
+        else:
+            if self.context is None:
+                self.context = self.get_context()
 
         if not self.num_inferences.get(self.cuda_stream.cuda_stream):
             self.num_inferences[self.cuda_stream.cuda_stream] = 0
+
+        self._ensure_initialized()
 
         self.cuda_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.cuda_stream):
@@ -318,7 +257,7 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
 
             with nvtx.annotate(f"tensorrt_execute.{self.num_inferences[self.cuda_stream.cuda_stream]}", color="blue"):
                 if asynchronous:
-                    self._execute_async(use_graph)
+                    self._execute_async(use_graph, capture_barrier, mutex)
                 else:
                     self._execute_sync()
 
@@ -330,27 +269,35 @@ class TensorRTExecutor(BaseExecutor, LoggingMixin):
         return results
 
     @nvtx_range()
-    def _execute_async(self, use_graph: bool) -> None:
+    def _execute_async(self, use_graph: bool, capture_barrier: Barrier, mutex: Union[nullcontext, Lock]) -> None:
         if self.cuda_graphs.get(self.cuda_stream.cuda_stream) and use_graph:
             self.cuda_graphs[self.cuda_stream.cuda_stream].replay()
             return
 
-        # TODO: Unnecessary to update addresses every iteration
-        ret = all(map(lambda node: self.context.set_tensor_address(node, self.bindings[
-            self.cuda_stream.cuda_stream][node].ptr), self.bindings[self.cuda_stream.cuda_stream]))
-        if not ret:
-            raise RuntimeError("Failed to set tensor addresses!")
+        if not self.num_inferences[self.cuda_stream.cuda_stream]:
+            ret = all(map(lambda node: self.context.set_tensor_address(node, self.bindings[
+                self.cuda_stream.cuda_stream][node].ptr), self.bindings[self.cuda_stream.cuda_stream]))
+            if not ret:
+                raise RuntimeError("Failed to set tensor addresses!")
 
         if use_graph:
-            self.cuda_graphs[self.cuda_stream.cuda_stream] = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.cuda_graphs[self.cuda_stream.cuda_stream], stream=self.cuda_stream):
-                self.context.execute_async_v3(self.cuda_stream.cuda_stream)
+            if not isinstance(capture_barrier, Barrier) or not isinstance(mutex, Lock):
+                raise Exception("Graph capture must be isolated and not parallel to other threads.")
+
+            with nvtx.annotate(f"graph capture: {self.cuda_stream.cuda_stream}"):
+                capture_barrier.wait()
+                with mutex:
+                    self.cuda_graphs[self.cuda_stream.cuda_stream] = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(self.cuda_graphs[self.cuda_stream.cuda_stream], stream=self.cuda_stream):
+                        self.context.execute_async_v3(self.cuda_stream.cuda_stream)
+                capture_barrier.wait()
         self.context.execute_async_v3(self.cuda_stream.cuda_stream)
 
     @nvtx_range()
     def _execute_sync(self) -> None:
-        # TODO: Unnecessary to update addresses every iteration
-        addresses = [item.ptr for item in self.bindings[self.cuda_stream.cuda_stream].values()]
+        if not self.num_inferences[self.cuda_stream.cuda_stream]:
+            self.addresses = [item.ptr for item in self.bindings[self.cuda_stream.cuda_stream].values()]
+
         torch.cuda.default_stream().wait_stream(self.cuda_stream)
         with torch.cuda.stream(self.cuda_stream):
-            self.context.execute_v2(addresses)
+            self.context.execute_v2(self.addresses)

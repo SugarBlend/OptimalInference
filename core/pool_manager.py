@@ -1,10 +1,11 @@
 from collections import deque
+from contextlib import nullcontext
 from deploy2serve.deployment.models.common import LoggingMeta
 from omegaconf import OmegaConf, DictConfig
 import time
 import torch
-import threading
-from typing import Dict, List
+from threading import Barrier, Lock, RLock
+from typing import Dict, List, Union
 
 from core.thread_worker import WorkerThread
 from core.override import TensorRTExecutor
@@ -23,7 +24,9 @@ class PoolManager(object, metaclass=LoggingMeta):
         streams_per_worker: int = 1,
         mixed_stream_config: List[int] = None,
         asynchronous: bool = False,
-        use_graph: bool = False
+        use_graph: bool = False,
+        use_unique_context: bool = False,
+        mutex: Union[nullcontext, Lock] = nullcontext()
     ):
         self.model_path: str = model_path
         self.input_shapes: Dict[str, tuple] = input_shapes
@@ -35,11 +38,13 @@ class PoolManager(object, metaclass=LoggingMeta):
         self.mixed_stream_config: List[int] = mixed_stream_config
         self.asynchronous: bool = asynchronous
         self.use_graph: bool = use_graph
+        self.use_unique_context: bool = use_unique_context
+        self.mutex: Union[nullcontext, Lock] = mutex
 
         self.workers: List[WorkerThread] = []
         self.task_counter = 0
         self.worker_rotation = deque()
-        self.lock = threading.RLock()
+        self.lock = RLock()
 
         self.start_time = time.time()
         self.total_submitted = 0
@@ -88,6 +93,7 @@ class PoolManager(object, metaclass=LoggingMeta):
 
         stream_configs = self._get_stream_configs()
 
+        capture_barrier = Barrier(parties=self.num_workers)
         for i in range(self.num_workers):
             num_streams = stream_configs[i] if i < len(stream_configs) else self.streams_per_worker
 
@@ -98,7 +104,10 @@ class PoolManager(object, metaclass=LoggingMeta):
                 enable_nvtx=self.enable_nvtx,
                 num_streams=num_streams,
                 asynchronous=self.asynchronous,
-                use_graph=self.use_graph
+                use_graph=self.use_graph,
+                capture_barrier=capture_barrier,
+                mutex=self.mutex,
+                use_unique_context=self.use_unique_context
             )
             self.workers.append(worker)
             self.worker_rotation.append(worker)
