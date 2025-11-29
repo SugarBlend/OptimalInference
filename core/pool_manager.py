@@ -8,7 +8,7 @@ from threading import Barrier, Lock, RLock
 from typing import Dict, List, Union
 
 from core.thread_worker import WorkerThread
-from core.override import TensorRTExecutor
+from core.override import TensorRTExecutor, ExecutorFactory, Backend
 from utils.wrappers import nvtx
 
 
@@ -85,11 +85,12 @@ class PoolManager(object, metaclass=LoggingMeta):
     @nvtx.annotate("initialize_worker_pool")
     def _initialize_workers(self) -> None:
         self.logger.info(
-            f"Initializing {self.num_workers} TensorRT workers with {self.streams_per_worker} streams each...")
-
-        self.deserialized_model = TensorRTExecutor.load(
-            self.model_path, self.device, self.log_level
+            f"Initializing {self.num_workers} TensorRT workers with {self.streams_per_worker} streams each..."
         )
+
+        #TODO: Disable force chosen of tensorrt, extend
+        executor = ExecutorFactory.create(Backend.TensorRT)
+        self.deserialized_model = executor.load(self.model_path, self.device, self.log_level)
 
         stream_configs = self._get_stream_configs()
 
@@ -181,11 +182,11 @@ class PoolManager(object, metaclass=LoggingMeta):
 
     def wait_all_completion(self, timeout: float = 30.0) -> bool:
         start_time = time.time()
-        while any(worker.has_pending_tasks() for worker in self.workers):
+        while any(worker.has_pending_tasks for worker in self.workers):
             if time.time() - start_time > timeout:
                 self.logger.warning("Timeout waiting for tasks completion")
                 return False
-            time.sleep(0.01)
+            time.sleep(1e-3)
         return True
 
     @nvtx.annotate("stop_worker_pool")
@@ -202,6 +203,7 @@ class PoolManager(object, metaclass=LoggingMeta):
 
         self.logger.info("All workers stopped")
 
+    #TODO: Update logic based on the updated constructor
     def resize_pool(self, new_size: int, new_streams_per_worker: int = None):
         with self.lock:
             if new_size == self.num_workers and new_streams_per_worker is None:
@@ -240,7 +242,7 @@ class PoolManager(object, metaclass=LoggingMeta):
                 total_streams = sum(worker.num_streams for worker in self.workers)
                 self.logger.info(f"Pool resized to {new_size} workers with {total_streams} total streams")
 
-    def get_pool_status(self) -> DictConfig:
+    def get_pool_status(self) -> str:
         workers_stats = [worker.get_stats() for worker in self.workers]
 
         total_processed = sum(stats["processed_tasks"] for stats in workers_stats)
@@ -251,7 +253,7 @@ class PoolManager(object, metaclass=LoggingMeta):
         uptime = time.time() - self.start_time
         throughput = total_processed / uptime if uptime > 0 else 0
 
-        return OmegaConf.create({
+        conf = OmegaConf.create({
             "total_workers": self.num_workers,
             "total_streams": total_streams,
             "streams_per_worker": self.streams_per_worker,
@@ -265,6 +267,7 @@ class PoolManager(object, metaclass=LoggingMeta):
             "uptime_seconds": uptime,
             "workers_status": workers_stats
         })
+        return OmegaConf.to_yaml(conf)
 
     def __enter__(self):
         return self

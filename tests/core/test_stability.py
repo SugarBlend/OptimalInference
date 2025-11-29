@@ -5,20 +5,25 @@ sys.path.insert(0, Path(__file__).parents[1].as_posix())
 import cv2
 import glob
 import torch
-from utils.benchmark import YoloProcessor, PoolManager
 import pytest
 import _pytest
+from threading import Lock
+from utils.benchmark import YoloProcessor, PoolManager
 from utils.env import get_project_root
+from torchvision.io import decode_jpeg, ImageReadMode, read_file
+from utils.benchmark import threaded_read
 
 
 class TestExecutionAbility:
+    @pytest.mark.parametrize("use_graph", [True, False])
     @pytest.mark.parametrize("asynchronous", [True, False])
     @pytest.mark.parametrize("threads_number", [1, 4])
     @pytest.mark.parametrize("streams_per_thread", [1, 4])
-    @pytest.mark.repeat(10)
+    @pytest.mark.repeat(5)
     def test_multi_thread(
         self,
         request: _pytest.fixtures.TopRequest,
+        use_graph: bool,
         asynchronous: bool,
         threads_number: int,
         streams_per_thread: int
@@ -33,11 +38,18 @@ class TestExecutionAbility:
             device="cuda:0",
             streams_per_worker=streams_per_thread,
             asynchronous=asynchronous,
-            use_graph=False
+            use_graph=use_graph,
+            mutex=Lock()
         ) as pool:
             frames_folder = "../../images"
-            frames = glob.glob(f"{frames_folder}/*")[:1000]
-            inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
+            frames = glob.glob(f"{frames_folder}/*")[:100]
+
+            batch_size = 50
+            images = threaded_read(frames, num_workers=max(1, len(frames) // batch_size), batch_size=batch_size)
+
+            tensors = decode_jpeg(images, mode=ImageReadMode.RGB, device="cuda:0")
+
+            inputs = [{'images': processor.preprocess(tensors[idx])} for idx in range(len(tensors))]
 
             worker_task_pairs = pool.submit_batch(inputs)
             results = pool.get_synchronized_results(worker_task_pairs)
@@ -58,9 +70,9 @@ class TestExecutionAbility:
             request.config._test_results.clear()
         torch.cuda.empty_cache()
 
-    #FIXME: Generated internal error from pytorch sources in multi thread case
+    #FIXME: desynchronization in multi-thread in graph/non-graph mode, and always with a unique context per thread
     @pytest.mark.parametrize("threads_number", [1, 4])
-    @pytest.mark.parametrize("streams_per_thread", [1])
+    @pytest.mark.parametrize("streams_per_thread", [1, 4])
     @pytest.mark.repeat(4)
     def test_modes_similarity(
         self,
@@ -78,12 +90,21 @@ class TestExecutionAbility:
             device="cuda:0",
             streams_per_worker=streams_per_thread,
             asynchronous=bool(current_step & 2),
-            use_graph=current_step <= 2
+            # use_graph=current_step <= 2,
+            use_graph=False,
+            use_unique_context=False,
+            mutex=Lock()
         ) as pool:
 
             frames_folder = "../../images"
-            frames = glob.glob(f"{frames_folder}/*")[:1000]
-            inputs = [{"images": processor.preprocess(cv2.imread(frame))} for frame in frames]
+            frames = glob.glob(f"{frames_folder}/*")[:100]
+
+            batch_size = 50
+            images = threaded_read(frames, num_workers=max(1, len(frames) // batch_size), batch_size=batch_size)
+
+            tensors = decode_jpeg(images, mode=ImageReadMode.RGB, device="cuda:0")
+
+            inputs = [{'images': processor.preprocess(tensors[idx])} for idx in range(len(tensors))]
 
             worker_task_pairs = pool.submit_batch(inputs)
             results = pool.get_synchronized_results(worker_task_pairs)

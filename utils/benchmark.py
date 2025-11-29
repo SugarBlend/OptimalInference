@@ -9,87 +9,17 @@ import click
 import nvtx
 from deploy2serve.utils.logger import get_logger
 import glob
-import numpy as np
 import torch
 import time
 from typing import Tuple, List, Optional
 from ultralytics.utils.ops import scale_boxes
 from ultralytics.utils.ops import non_max_suppression
-from turbojpeg import TurboJPEG
+from torchvision.io import decode_jpeg, ImageReadMode, read_file
+from torchvision.utils import draw_bounding_boxes
 
 from core.pool_manager import PoolManager
 from utils.env import get_project_root
 from concurrent.futures import ThreadPoolExecutor
-
-
-def imshow_det_bboxes(img: np.ndarray,
-                      bboxes: np.ndarray,
-                      labels: np.ndarray,
-                      class_names: List[str] = None,
-                      score_thr: float = 0,
-                      bbox_color: Tuple[int, ...] = (0, 255, 0),
-                      text_color: Tuple[int, ...] = (0, 255, 0),
-                      thickness: int = 1,
-                      font_scale: float = 0.5,
-                      show: bool = True,
-                      win_name: str = '',
-                      wait_time: int = 0,
-                      out_file: Optional[str] = None):
-    """Draw bboxes and class labels (with scores) on an image.
-
-    Args:
-        img (str or ndarray): The image to be displayed.
-        bboxes (ndarray): Bounding boxes (with scores), shaped (n, 4) or
-            (n, 5).
-        labels (ndarray): Labels of bboxes.
-        class_names (list[str]): Names of each classes.
-        score_thr (float): Minimum score of bboxes to be shown.
-        bbox_color (Color or str or tuple or int or ndarray): Color
-            of bbox lines.
-        text_color (Color or str or tuple or int or ndarray): Color
-            of texts.
-        thickness (int): Thickness of lines.
-        font_scale (float): Font scales of texts.
-        show (bool): Whether to show the image.
-        win_name (str): The window name.
-        wait_time (int): Value of waitKey param.
-        out_file (str or None): The filename to write the image.
-
-    Returns:
-        ndarray: The image with bboxes drawn on it.
-    """
-    assert bboxes.ndim == 2
-    assert labels.ndim == 1
-    assert bboxes.shape[0] == labels.shape[0]
-    assert bboxes.shape[1] == 4 or bboxes.shape[1] == 5
-    img = np.ascontiguousarray(img)
-
-    if score_thr > 0:
-        assert bboxes.shape[1] == 5
-        scores = bboxes[:, -1]
-        inds = scores > score_thr
-        bboxes = bboxes[inds, :]
-        labels = labels[inds]
-
-    for bbox, label in zip(bboxes, labels):
-        bbox_int = bbox.astype(np.int32)
-        left_top = (bbox_int[0], bbox_int[1])
-        right_bottom = (bbox_int[2], bbox_int[3])
-        cv2.rectangle(
-            img, left_top, right_bottom, bbox_color, thickness=thickness)
-        label_text = class_names[
-            label] if class_names is not None else f'cls {label}'
-        if len(bbox) > 4:
-            label_text += f'|{bbox[-1]:.02f}'
-        cv2.putText(img, label_text, (bbox_int[0], bbox_int[1] - 2),
-                    cv2.FONT_HERSHEY_COMPLEX, font_scale, text_color)
-
-    if show:
-        cv2.imshow(win_name, img)
-        cv2.waitKey(wait_time)
-    if out_file is not None:
-        cv2.imwrite(out_file, img)
-    return img
 
 
 class YoloProcessor(object):
@@ -108,7 +38,7 @@ class YoloProcessor(object):
         stride: int = 32
     ) -> Tuple[torch.Tensor, float, Tuple[float, float]]:
         # Resize and pad image while meeting stride-multiple constraints
-        shape = image.shape[:2]  # current shape [height, width]
+        shape = image.shape[-2:]  # current shape [height, width]
 
         # Scale ratio (new / old)
         r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
@@ -131,8 +61,6 @@ class YoloProcessor(object):
         bottom = int(torch.round(torch.tensor(dh + 0.1)).item())
         left = int(torch.round(torch.tensor(dw - 0.1)).item())
         right = int(torch.round(torch.tensor(dw + 0.1)).item())
-
-        image = image.permute(2, 0, 1)
         image = image.unsqueeze(0).float()
 
         if shape[::-1] != new_unpad:
@@ -151,29 +79,37 @@ class YoloProcessor(object):
                 value=float(color[0]) / 255.0
             )
 
-        image = image[:, [2, 1, 0]].contiguous()
-
         return image / 255., r, (dw, dh)
 
-    def preprocess(self, image: np.ndarray) -> torch.Tensor:
-        if self.input is None:
-            self.input = torch.from_numpy(image).cuda()
-        else:
-            self.input.copy_(torch.from_numpy(image))
-        return self.letterbox(self.input, self.input_shape)[0]
+    def preprocess(self, image: torch.Tensor) -> torch.Tensor:
+        return self.letterbox(image, self.input_shape)[0]
 
     def postprocess(
         self, output: torch.Tensor, orig_shape
-    ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
-        boxes: List[np.ndarray] = []
-        scores: List[np.ndarray] = []
-        classes: List[np.ndarray] = []
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        boxes: List[torch.Tensor] = []
+        scores: List[torch.Tensor] = []
+        classes: List[torch.Tensor] = []
         for idx in range(len(output)):
             detections = non_max_suppression(output[idx])[0]
-            boxes.append(scale_boxes(self.input_shape, detections[:, :4], orig_shape).cpu().numpy())
-            scores.append(detections[:, 4:5].reshape(-1, 1).cpu().numpy())
-            classes.append(detections[:, 5:].reshape(-1).to(torch.int).cpu().numpy())
+            boxes.append(scale_boxes(self.input_shape, detections[:, :4], orig_shape))
+            scores.append(detections[:, 4:5].reshape(-1, 1))
+            classes.append(detections[:, 5:].reshape(-1).to(torch.int))
         return boxes, scores, classes
+
+
+def threaded_read(frames: List[str], num_workers: int = 8, batch_size: int = 50) -> List[torch.Tensor]:
+    total_frames = len(frames)
+    images: List[torch.Tensor] = []
+
+    with tqdm(total=total_frames, desc="Loading frames") as pbar:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            for i in range(0, total_frames, batch_size):
+                batch_paths = frames[i: i + batch_size]
+                batch_images = list(executor.map(lambda path: read_file(path), batch_paths))
+                images.extend(batch_images)
+                pbar.update(len(batch_images))
+    return images
 
 
 @click.command()
@@ -189,7 +125,7 @@ def simple_launch(frames_folder, no_preview):
         pool = PoolManager(
             model_path=f"{get_project_root()}/checkpoints/yolo/tensorrt/model.plan",
             input_shapes={"images": (1, 3, 384, 640), "output": (1, 84, 5040)},
-            num_workers=10,
+            num_workers=1,
             device="cuda:0",
             streams_per_worker=1,
             asynchronous=True,
@@ -199,33 +135,23 @@ def simple_launch(frames_folder, no_preview):
         )
 
     try:
-        jpeg = TurboJPEG(r"E:\SDK\libjpeg-turbo-gcc64\bin\libturbojpeg.dll")
+        frames = glob.glob(f"{frames_folder}/*")[:100]
 
-        def img_decode(path: str) -> np.ndarray:
-            with open(path, "rb") as file:
-                return jpeg.decode(file.read())
+        with nvtx.annotate("read files"):
+            batch_size = 50
+            images = threaded_read(frames, num_workers=max(1, len(frames) // batch_size), batch_size=batch_size)
 
-        def threaded_read(frames: List[str], num_workers: int = 8, batch_size: int = 50) -> List[np.ndarray]:
-            total_frames = len(frames)
-            all_images: List[np.ndarray] = []
+        with nvtx.annotate("convert raw buffers to cuda tensors"):
+            tensors = decode_jpeg(images, mode=ImageReadMode.RGB, device="cuda:0")
 
-            with tqdm(total=total_frames, desc="Loading frames") as pbar:
-                with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                    for i in range(0, total_frames, batch_size):
-                        batch_paths = frames[i:i + batch_size]
-                        batch_images = list(executor.map(img_decode, batch_paths))
-                        all_images.extend(batch_images)
-                        pbar.update(len(batch_images))
-            return all_images
+        with nvtx.annotate("preprocess for inputs"):
+            inputs = [{'images': processor.preprocess(tensors[idx])} for idx in range(len(tensors))]
 
-        frames = glob.glob(f"{frames_folder}/*")[:1000]
-        images = threaded_read(frames, num_workers=8, batch_size=50)
-        inputs = [{'images': processor.preprocess(img)} for img in images]
-
-        start_time = time.time()
-        worker_task_pairs = pool.submit_batch(inputs)
-        results = pool.get_synchronized_results(worker_task_pairs)
-        total_time = time.time() - start_time
+        with nvtx.annotate("processing tasks"):
+            start_time = time.time()
+            worker_task_pairs = pool.submit_batch(inputs)
+            results = pool.get_synchronized_results(worker_task_pairs)
+            total_time = time.time() - start_time
 
         successful = len([r for r in results if r is not None])
 
@@ -234,16 +160,18 @@ def simple_launch(frames_folder, no_preview):
         logger.info(f"Throughput: {successful / total_time:.2f} inferences/sec")
         status = pool.get_pool_status()
         logger.info(f"Pool status: {status}")
+
         if not no_preview:
             for idx, result in enumerate(results):
-                image = cv2.imread(frames[idx])
-
-                boxes, scores, classes = processor.postprocess(result, image.shape[:2])
+                boxes, scores, classes = processor.postprocess(result, tensors[idx].shape[-2:])
                 if len(boxes):
-                    imshow_det_bboxes(
-                        image.copy(), np.concatenate([boxes[0], scores[0]], axis=1), classes[0],
-                        bbox_color=(0, 233, 255), text_color=(0, 233, 255), thickness=2, show=True,
+                    labels = [f"{classes[0][j].item()}: {round(scores[0][j].item(), ndigits=2)}"
+                              for j in range(len(classes[0]))]
+                    image = draw_bounding_boxes(
+                        tensors[idx], boxes[0], labels, colors=[(0, 233, 255)] * boxes[0].shape[0], width=2
                     )
+                    cv2.imshow("", image.permute(1, 2, 0).cpu().numpy())
+                    cv2.waitKey(0)
 
     except KeyboardInterrupt:
         logger.warning("Stopping...")

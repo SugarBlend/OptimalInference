@@ -14,15 +14,14 @@ class Mode(str, Enum):
 
 @click.command()
 @click.option("--profiling-file", type=str, default="../utils/benchmark.py", help="File for start testing.")
-@click.option("--output-name", type=str, default="demo", help="Stem of output files with profiling info.")
 @click.option(
     "--mode", type=Mode, default=Mode.Full, 
     help="Mode for profile: 1: Full - with CPU, GPU, CUDA API ...; 2: Medium - GPU inspect with memory control ...; "
          "3: Light - Base measurement of cuda, cublas, etc. using."
 )
-def profile_with_nsight_systems(profiling_file: str, output_name: str, mode: Mode) -> None:
+def profile_with_nsight_systems(profiling_file: str, mode: Mode) -> None:
     root = Path(__file__).parent
-    command = f"nsys profile* --output={output_name} {sys.executable} {root}/{profiling_file}"
+    command = f"nsys profile* {sys.executable} {root}/{profiling_file}"
     flags = {
         "trace": ["cuda", "nvtx", "cublas", "cublas-verbose", "cusparse", "cusparse-verbose"],
         "force-overwrite": "true",

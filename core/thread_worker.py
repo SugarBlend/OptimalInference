@@ -28,10 +28,7 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         mutex: Union[nullcontext, Lock] = nullcontext(),
         use_unique_context: bool = False
     ):
-        super().__init__(
-            name=f"TRT-Worker-{worker_id}-{num_streams}streams",
-            daemon=daemon
-        )
+        super().__init__(name=f"WorkerThread-{worker_id}", daemon=daemon)
         self.completion_events: Dict[int, torch.cuda.Event] = {}
         self.event_lock = threading.Lock()
 
@@ -60,6 +57,18 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         self.failed_tasks: int = 0
         self.lock: Lock = Lock()
 
+    @property
+    def running(self) -> bool:
+        return self._running and self.is_alive()
+
+    @property
+    def has_pending_tasks(self) -> bool:
+        return not self.input_queue.empty()
+
+    @property
+    def pending_tasks_count(self) -> int:
+        return self.input_queue.qsize()
+
     def _initialize_streams(self) -> None:
         for i in range(self.num_streams):
             stream = torch.cuda.Stream(device=self.device)
@@ -71,10 +80,6 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
             stream_id = self.stream_rotation[0]
             self.stream_rotation.rotate(-1)
             return stream_id, self.streams[stream_id]
-
-    @property
-    def running(self) -> bool:
-        return self._running and self.is_alive()
 
     def submit(self, input_feed: Dict[str, torch.Tensor]) -> int:
         task_id = int(time.time() * 1000) + self.worker_id * 10000 + self.processed_tasks
@@ -98,42 +103,9 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
         except Empty:
             return None
 
-    @nvtx.annotate("_process_next_task")
-    def _process_next_task(self) -> None:
-        def push_results(task_id: int, results: Optional[List[torch.Tensor]] = None) -> None:
-            # Record point to get synchronized results from parallel tasks
-            with self.event_lock:
-                event = self.completion_events.get(task_id)
-                if event is not None:
-                    event.record(stream)
-            self.result_queue.put_nowait((task_id, results))
-
-        try:
-            task_id, input_feed, stream_id = self.input_queue.get_nowait()
-            stream = self.streams[stream_id]
-
-            with nvtx.annotate(f"Worker_{self.worker_id}_stream_{stream_id}_process_task"):
-                results = self._execute_inference(input_feed, stream)
-                push_results(task_id, results)
-                with self.lock:
-                    self.processed_tasks += 1
-        except Empty:
-            time.sleep(1e-4)
-        except Exception as error:
-            with self.lock:
-                self.failed_tasks += 1
-            self.logger.error(f"Worker error: {error}")
-            push_results(task_id)
-
     def cleanup_completion_event(self, task_id: int) -> None:
         with self.event_lock:
             self.completion_events.pop(task_id, None)
-
-    def has_pending_tasks(self) -> bool:
-        return not self.input_queue.empty()
-
-    def pending_tasks_count(self) -> int:
-        return self.input_queue.qsize()
 
     def get_stats(self) -> DictConfig:
         with self.lock:
@@ -142,7 +114,7 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
                 "num_streams": self.num_streams,
                 "processed_tasks": self.processed_tasks,
                 "failed_tasks": self.failed_tasks,
-                "pending_tasks": self.pending_tasks_count(),
+                "pending_tasks": self.pending_tasks_count,
                 "is_alive": self.is_alive()
             }
         return OmegaConf.create(stats_dict)
@@ -174,6 +146,32 @@ class WorkerThread(Thread, metaclass=LoggingMeta):
             self._running = False
             nvtx.mark(f"Worker_{self.worker_id}_finished")
             self.logger.info(f"Worker {self.worker_id} finished")
+
+    @nvtx.annotate("_process_next_task")
+    def _process_next_task(self) -> None:
+        def push_results(task_id: int, results: Optional[List[torch.Tensor]] = None) -> None:
+            # Record point to get synchronized results from parallel tasks
+            with self.event_lock:
+                event = self.completion_events.get(task_id)
+                if event is not None:
+                    event.record(self.streams[stream_id])
+            self.result_queue.put_nowait((task_id, results))
+
+        try:
+            task_id, input_feed, stream_id = self.input_queue.get_nowait()
+
+            with nvtx.annotate(f"Worker:{self.worker_id} stream:{stream_id} process task:{task_id}"):
+                results = self._execute_inference(input_feed, self.streams[stream_id])
+                push_results(task_id, results)
+                with self.lock:
+                    self.processed_tasks += 1
+        except Empty:
+            time.sleep(1e-4)
+        except Exception as error:
+            with self.lock:
+                self.failed_tasks += 1
+            self.logger.error(f"Worker error: {error}")
+            push_results(task_id)
 
     def _execute_inference(self, input_feed: Dict[str, torch.Tensor], stream: torch.cuda.Stream) -> List[torch.Tensor]:
         stream_name = f"Worker_{self.worker_id}_stream_{self.streams.index(stream)}"
